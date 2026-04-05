@@ -1,7 +1,6 @@
 /**
  * HMAC-SHA256 Signature Generator
- * * This helper function signs the JSON payload using a secret key.
- * It ensures the integrity of the data between Cloudflare and your webhook.
+ * Signs the JSON payload using a secret key to ensure data integrity.
  */
 async function generateSignature(payloadString, secret) {
   const encoder = new TextEncoder();
@@ -17,18 +16,17 @@ async function generateSignature(payloadString, secret) {
   );
 
   const signature = await crypto.subtle.sign("HMAC", cryptoKey, data);
+  
+  // Returns a Base64 encoded string
   return btoa(String.fromCharCode(...new Uint8Array(signature)));
 }
 
-/**
- * Main Email Worker Logic
- */
 export default {
   async email(message, env, ctx) {
-    // Extract the raw email stream
+    // 1. Extract raw email content
     const rawEmail = await new Response(message.raw).text();
 
-    // Prepare the payload
+    // 2. Prepare the JSON payload
     const payload = {
       source: "cloudflare-worker",
       timestamp: new Date().toISOString(),
@@ -36,19 +34,21 @@ export default {
         from: message.from,
         to: message.to,
       },
-      // This is the full, unparsed MIME string
       raw: rawEmail
     };
 
     const bodyString = JSON.stringify(payload);
 
     try {
-      // Generate the signature using the Secret from your Dashboard
-      // Ensure 'WEBHOOK_SECRET' is added as an Encrypted Secret in Cloudflare
+      // 3. Verify the Secret exists in Environment Variables
+      if (!env.WEBHOOK_SECRET) {
+        throw new Error("Environment variable 'WEBHOOK_SECRET' is not defined.");
+      }
+
+      // 4. Generate the HMAC signature
       const signature = await generateSignature(bodyString, env.WEBHOOK_SECRET);
 
-      // Send to your defined Webhook URL using the environment variable
-      // Ensure 'webhookUrl' is defined in your Worker's Settings > Variables
+      // 5. POST to the Webhook
       const response = await fetch(env.webhookUrl, {
         method: "POST",
         headers: {
@@ -59,19 +59,16 @@ export default {
         body: bodyString,
       });
 
-      // Handle Offline/Error States
+      // 6. Handle failure (Triggering a 4xx/Soft-Fail for retries)
       if (!response.ok) {
-        // Throwing an error triggers a temporary failure (4xx). 
-        // The sender's server will keep the mail and retry later.
-        throw new Error(`Upstream webhook error (${response.status})`);
+        throw new Error(`Upstream webhook returned status: ${response.status}`);
       }
 
-      console.log(`Relay successful for: ${message.from}`);
+      console.log(`Successfully relayed email from: ${message.from}`);
 
     } catch (error) {
-      // Catch network timeouts, DNS failures, or missing Secrets
-      // Re-throwing ensures the email stays in the sender's queue for a silent retry
-      console.error("Worker fetch exception:", error.message);
+      // Log the error and throw to ensure the mail server retries later
+      console.error("Relay Error:", error.message);
       throw error;
     }
   },
