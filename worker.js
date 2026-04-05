@@ -23,27 +23,30 @@ async function generateSignature(payloadString, secret) {
 
 export default {
   async email(message, env, ctx) {
-    // 1. Extract raw email content
-    const rawEmail = await new Response(message.raw).text();
-
-    // 2. Prepare the JSON payload
-    const payload = {
-      source: "cloudflare-worker",
-      timestamp: new Date().toISOString(),
-      envelope: {
-        from: message.from,
-        to: message.to,
-      },
-      raw: rawEmail
-    };
-
-    const bodyString = JSON.stringify(payload);
-
     try {
-      // 3. Verify the Secret exists in Environment Variables
+      // 1. Safety Check: Ensure required variables exist
       if (!env.WEBHOOK_SECRET) {
-        throw new Error("Environment variable 'WEBHOOK_SECRET' is not defined.");
+        throw new Error("Missing WEBHOOK_SECRET in Cloudflare Variables");
       }
+      if (!env.webhookUrl) {
+        throw new Error("Missing webhookUrl in Cloudflare Variables");
+      }
+
+      // 2. Extract raw email content
+      const rawEmail = await new Response(message.raw).text();
+
+      // 3. Prepare the JSON payload
+      const payload = {
+        source: "cloudflare-worker",
+        timestamp: new Date().toISOString(),
+        envelope: {
+          from: message.from,
+          to: message.to,
+        },
+        raw: rawEmail
+      };
+
+      const bodyString = JSON.stringify(payload);
 
       // 4. Generate the HMAC signature
       const signature = await generateSignature(bodyString, env.WEBHOOK_SECRET);
@@ -61,14 +64,16 @@ export default {
 
       // 6. Handle failure (Triggering a 4xx/Soft-Fail for retries)
       if (!response.ok) {
-        throw new Error(`Upstream webhook returned status: ${response.status}`);
+        throw new Error(`Upstream returned ${response.status}`);
       }
 
-      console.log(`Successfully relayed email from: ${message.from}`);
+      console.log(`Relay successful: ${message.from}`);
 
     } catch (error) {
-      // Log the error and throw to ensure the mail server retries later
-      console.error("Relay Error:", error.message);
+      // Log the specific error to the Cloudflare dashboard
+      console.error("Worker Error:", error.message);
+      
+      // Re-throw so the email stays in the sender's queue
       throw error;
     }
   },
