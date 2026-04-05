@@ -5,7 +5,7 @@ const item = $input.item; // Get the full item (JSON + Binary)
 const headers = item.json.headers;
 const receivedSecret = headers['x-webhook-secret'];
 
-// VERIFY THE SECRET
+// VERIFY THE SHARED SECRET
 const isValid = (receivedSecret === MY_SECRET);
 
 // RETURN RESULTS (Preserving Binary)
@@ -23,10 +23,9 @@ if (isValid) {
   return {
     json: {
       authenticated: false,
-      details: "Access Denied: Secret Mismatch",
+      details: "Access Denied",
       debug: {
-        received: receivedSecret,
-        expected: MY_SECRET
+        secret_present: !!receivedSecret
       }
     }
   };

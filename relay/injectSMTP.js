@@ -21,7 +21,7 @@ for (let i = 0; i < items.length; i++) {
 
     // SMTP SETUP
     const transporter = nodemailer.createTransport({
-      host: "SMTP_HOST", 
+      host: "SMTP_HOST",
       port: 25,
       secure: false,
       auth: {
