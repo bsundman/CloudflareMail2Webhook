@@ -1,41 +1,21 @@
 /**
- * HMAC-SHA256 Signature Generator
- * Signs the JSON payload using a secret key to ensure data integrity.
+ * Main Email Worker Logic
  */
-async function generateSignature(payloadString, secret) {
-  const encoder = new TextEncoder();
-  const keyData = encoder.encode(secret);
-  const data = encoder.encode(payloadString);
-
-  const cryptoKey = await crypto.subtle.importKey(
-    "raw",
-    keyData,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-
-  const signature = await crypto.subtle.sign("HMAC", cryptoKey, data);
-  
-  // Returns a Base64 encoded string
-  return btoa(String.fromCharCode(...new Uint8Array(signature)));
-}
-
 export default {
   async email(message, env, ctx) {
     try {
-      // 1. Safety Check: Ensure required variables exist
+      // Safety Check: Ensure required variables exist
       if (!env.WEBHOOK_SECRET) {
         throw new Error("Missing WEBHOOK_SECRET in Cloudflare Variables");
       }
-      if (!env.webhookUrl) {
-        throw new Error("Missing webhookUrl in Cloudflare Variables");
+      if (!env.WEBHOOK_URL) {
+        throw new Error("Missing WEBHOOK_URL in Cloudflare Variables");
       }
 
-      // 2. Extract raw email content
+      // Extract raw email content
       const rawEmail = await new Response(message.raw).text();
 
-      // 3. Prepare the JSON payload
+      // Prepare the JSON payload
       const payload = {
         source: "cloudflare-worker",
         timestamp: new Date().toISOString(),
@@ -48,21 +28,19 @@ export default {
 
       const bodyString = JSON.stringify(payload);
 
-      // 4. Generate the HMAC signature
-      const signature = await generateSignature(bodyString, env.WEBHOOK_SECRET);
-
-      // 5. POST to the Webhook
-      const response = await fetch(env.webhookUrl, {
+      // POST to the Webhook
+      const response = await fetch(env.WEBHOOK_URL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Webhook-Signature": signature,
+          // Sending the unique secret directly as a static password
+          "X-Webhook-Secret": env.WEBHOOK_SECRET,
           "User-Agent": "Cloudflare-Email-Relay"
         },
         body: bodyString,
       });
 
-      // 6. Handle failure (Triggering a 4xx/Soft-Fail for retries)
+      // Handle failure (Triggering a 4xx/Soft-Fail for retries)
       if (!response.ok) {
         throw new Error(`Upstream returned ${response.status}`);
       }
