@@ -14,33 +14,40 @@ const transporter = nodemailer.createTransport({
 });
 
 for (let i = 0; i < items.length; i++) {
-  const item = items[i].json;
-  // PATH SELECTION
-  // We look for 'item.data' (if nested by verification) or 'item' (if top-level)
-  const payload = item.data || item;
+  const item = items[i];
+  const payload = item.json?.data || item.json || {};
+  const binaryPropertyName = payload.binaryProperty || Object.keys(item.binary ?? {})[0] || null;
 
   const from = payload.envelope?.from;
   const to = payload.envelope?.to;
-  const rawMimeString = payload.raw;
 
-  if (!from || !to || !rawMimeString) {
-    throw new Error(`Missing JSON fields. From: ${!!from}, To: ${!!to}, Raw: ${!!rawMimeString}`);
+  if (!from || !to || !binaryPropertyName) {
+    throw new Error(
+      `Missing input fields. From: ${!!from}, To: ${!!to}, Binary: ${!!binaryPropertyName}`
+    );
+  }
+
+  const rawMimeBuffer = await this.helpers.getBinaryDataBuffer(i, binaryPropertyName);
+
+  if (!rawMimeBuffer?.length) {
+    throw new Error(`Empty MIME payload in binary property "${binaryPropertyName}"`);
   }
 
   try {
     const info = await transporter.sendMail({
       envelope: { from, to },
-      raw: rawMimeString,
+      raw: rawMimeBuffer,
     });
 
-    returnData.push({ 
-      json: { 
-        success: true, 
-        messageId: info.messageId, 
+    returnData.push({
+      json: {
+        success: true,
+        messageId: info.messageId,
         recipient: to,
         recipientDomain: payload.routing?.recipientDomain || (to.split('@')[1] || '').toLowerCase(),
         workerEventId: payload.eventId || null,
-      } 
+        rawSize: rawMimeBuffer.length,
+      }
     });
   } catch (error) {
     const debug = {
@@ -49,7 +56,8 @@ for (let i = 0; i < items.length; i++) {
         payload.routing?.recipientDomain ||
         ((to || "").split('@')[1] || "").toLowerCase(),
       worker_event_id: payload.eventId || null,
-      mime_start: (rawMimeString || "").substring(0, 20),
+      raw_size: rawMimeBuffer.length,
+      binary_property: binaryPropertyName,
     };
 
     throw new Error(`SMTP injection failed: ${error.message} | ${JSON.stringify(debug)}`);

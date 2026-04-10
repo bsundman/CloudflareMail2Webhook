@@ -13,12 +13,19 @@ function getWebhookTimeoutMs(env) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 10000;
 }
 
+function setOptionalHeader(headers, name, value) {
+  if (value !== null && value !== undefined && value !== "") {
+    headers.set(name, value);
+  }
+}
+
 /**
  * Main Email Worker Logic
  */
 export default {
   async email(message, env, ctx) {
     const eventId = crypto.randomUUID();
+    const timestamp = new Date().toISOString();
     const recipientDomain = getAddressDomain(message.to);
     const recipientLocalPart = getAddressLocalPart(message.to);
     const messageId = message.headers.get("message-id");
@@ -32,31 +39,23 @@ export default {
         throw new Error("Missing WEBHOOK_URL in Cloudflare Variables");
       }
 
-      const rawEmail = await new Response(message.raw).text();
-
-      const payload = {
-        source: "cloudflare-worker",
-        eventId,
-        timestamp: new Date().toISOString(),
-        envelope: {
-          from: message.from,
-          to: message.to,
-        },
-        routing: {
-          recipientDomain,
-          recipientLocalPart,
-        },
-        headers: {
-          messageId,
-          subject,
-        },
-        rawSize: message.rawSize,
-        raw: rawEmail,
-      };
-
-      const bodyString = JSON.stringify(payload);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort("Webhook timeout"), getWebhookTimeoutMs(env));
+      const requestHeaders = new Headers({
+        "Content-Type": "message/rfc822",
+        "User-Agent": "Cloudflare-Email-Relay",
+        "X-Webhook-Secret": env.WEBHOOK_SECRET,
+        "X-Email-Source": "cloudflare-worker",
+        "X-Email-Event-Id": eventId,
+        "X-Email-Timestamp": timestamp,
+        "X-Envelope-From": message.from,
+        "X-Envelope-To": message.to,
+        "X-Recipient-Domain": recipientDomain,
+        "X-Recipient-Local-Part": recipientLocalPart,
+        "X-Email-Raw-Size": String(message.rawSize),
+      });
+
+      setOptionalHeader(requestHeaders, "X-Email-Message-Id", messageId);
 
       console.log(
         JSON.stringify({
@@ -76,16 +75,18 @@ export default {
       try {
         response = await fetch(env.WEBHOOK_URL, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Webhook-Secret": env.WEBHOOK_SECRET,
-            "User-Agent": "Cloudflare-Email-Relay",
-          },
-          body: bodyString,
+          headers: requestHeaders,
+          body: message.raw,
           signal: controller.signal,
+          redirect: "manual",
         });
       } finally {
         clearTimeout(timeoutId);
+      }
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        throw new Error(`Upstream redirected with ${response.status}${location ? ` to ${location}` : ""}`);
       }
 
       if (!response.ok) {
@@ -100,6 +101,7 @@ export default {
           eventId,
           to: message.to,
           recipientDomain,
+          responseUrl: response.url,
           status: response.status,
         })
       );
