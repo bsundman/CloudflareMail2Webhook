@@ -1,10 +1,30 @@
+function getAddressDomain(address) {
+  const atIndex = address.lastIndexOf("@");
+  return atIndex === -1 ? "" : address.slice(atIndex + 1).toLowerCase();
+}
+
+function getAddressLocalPart(address) {
+  const atIndex = address.lastIndexOf("@");
+  return atIndex === -1 ? address : address.slice(0, atIndex);
+}
+
+function getWebhookTimeoutMs(env) {
+  const parsed = Number.parseInt(env.WEBHOOK_TIMEOUT_MS ?? "10000", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 10000;
+}
+
 /**
  * Main Email Worker Logic
  */
 export default {
   async email(message, env, ctx) {
+    const eventId = crypto.randomUUID();
+    const recipientDomain = getAddressDomain(message.to);
+    const recipientLocalPart = getAddressLocalPart(message.to);
+    const messageId = message.headers.get("message-id");
+    const subject = message.headers.get("subject");
+
     try {
-      // Safety Check: Ensure required variables exist
       if (!env.WEBHOOK_SECRET) {
         throw new Error("Missing WEBHOOK_SECRET in Cloudflare Variables");
       }
@@ -12,46 +32,93 @@ export default {
         throw new Error("Missing WEBHOOK_URL in Cloudflare Variables");
       }
 
-      // Extract raw email content
       const rawEmail = await new Response(message.raw).text();
 
-      // Prepare the JSON payload
       const payload = {
         source: "cloudflare-worker",
+        eventId,
         timestamp: new Date().toISOString(),
         envelope: {
           from: message.from,
           to: message.to,
         },
-        raw: rawEmail
+        routing: {
+          recipientDomain,
+          recipientLocalPart,
+        },
+        headers: {
+          messageId,
+          subject,
+        },
+        rawSize: message.rawSize,
+        raw: rawEmail,
       };
 
       const bodyString = JSON.stringify(payload);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort("Webhook timeout"), getWebhookTimeoutMs(env));
 
-      // POST to the Webhook
-      const response = await fetch(env.WEBHOOK_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          // Sending the unique secret directly as a static password
-          "X-Webhook-Secret": env.WEBHOOK_SECRET,
-          "User-Agent": "Cloudflare-Email-Relay"
-        },
-        body: bodyString,
-      });
+      console.log(
+        JSON.stringify({
+          level: "info",
+          event: "mail_received",
+          eventId,
+          from: message.from,
+          to: message.to,
+          recipientDomain,
+          rawSize: message.rawSize,
+          messageId,
+        })
+      );
 
-      // Handle failure (Triggering a 4xx/Soft-Fail for retries)
-      if (!response.ok) {
-        throw new Error(`Upstream returned ${response.status}`);
+      let response;
+
+      try {
+        response = await fetch(env.WEBHOOK_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Webhook-Secret": env.WEBHOOK_SECRET,
+            "User-Agent": "Cloudflare-Email-Relay",
+          },
+          body: bodyString,
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeoutId);
       }
 
-      console.log(`Relay successful: ${message.from}`);
+      if (!response.ok) {
+        const upstreamBody = (await response.text()).slice(0, 500);
+        throw new Error(`Upstream returned ${response.status}: ${upstreamBody}`);
+      }
 
+      console.log(
+        JSON.stringify({
+          level: "info",
+          event: "mail_relay_success",
+          eventId,
+          to: message.to,
+          recipientDomain,
+          status: response.status,
+        })
+      );
     } catch (error) {
-      // Log the specific error to the Cloudflare dashboard
-      console.error("Worker Error:", error.message);
-      
-      // Re-throw so the email stays in the sender's queue
+      console.error(
+        JSON.stringify({
+          level: "error",
+          event: "mail_relay_failure",
+          eventId,
+          from: message.from,
+          to: message.to,
+          recipientDomain,
+          rawSize: message.rawSize,
+          messageId,
+          subject,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      );
+
       throw error;
     }
   },
