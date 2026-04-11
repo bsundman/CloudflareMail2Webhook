@@ -175,6 +175,16 @@ async function getStoredMessageBody(env, metadata) {
   return body;
 }
 
+async function readIncomingMessageBody(message) {
+  const body = await new Response(message.raw).arrayBuffer();
+
+  if (!body.byteLength) {
+    throw new Error("Incoming message body is empty");
+  }
+
+  return body;
+}
+
 async function enqueueRetry(env, metadata, delaySeconds) {
   await env.MAIL_RETRY_QUEUE.send(
     {
@@ -247,7 +257,9 @@ export default {
         storageKey: metadata.storageKey,
       });
 
-      await env.MAIL_R2.put(metadata.storageKey, message.raw, {
+      const incomingBody = await readIncomingMessageBody(message);
+
+      await env.MAIL_R2.put(metadata.storageKey, incomingBody, {
         httpMetadata: {
           contentType: "message/rfc822",
         },
@@ -261,8 +273,7 @@ export default {
       });
 
       try {
-        const directBody = await getStoredMessageBody(env, metadata);
-        const response = await deliverToWebhook(env, metadata, directBody, "direct");
+        const response = await deliverToWebhook(env, metadata, incomingBody, "direct");
 
         scheduleDelete(ctx, env, metadata, "direct_delivery");
 
