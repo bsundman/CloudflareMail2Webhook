@@ -19,6 +19,7 @@ Script for Cloudflare worker to process and send email to external webhook url
 - If you keep the webhook behind Cloudflare Access, add `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` as Worker secrets.
 - The R2 object key is now opaque, the retry queue only stores that opaque key, and the Worker logs no longer include sender, recipient, subject, or message ID.
 - `relay/decryptMime.js` supports both the current self-describing encrypted payload and the previous header-assisted encrypted format during rollout.
+- Runtime vars/secrets are meant to live in the Cloudflare dashboard, and `keep_vars = true` in [wrangler.toml](/Users/brian/code/CloudflareMail2Webhook/wrangler.toml) preserves them on deploy.
 
 # Deploy
 - Create one R2 bucket for stored encrypted payloads.
@@ -36,14 +37,13 @@ Script for Cloudflare worker to process and send email to external webhook url
    - queue consumer -> Queue `email`
    - dead-letter queue -> `dlq`
 4. Add Worker secrets/vars in the dashboard:
-   - `WEBHOOK_URL`
-   - `WEBHOOK_SECRET`
-   - `WEBHOOK_TIMEOUT_MS`
-   - `WEBHOOK_RETRY_DELAY_SECONDS`
-   - `EMAIL_ENCRYPTION_KEY_ID`
-   - secret: `EMAIL_ENCRYPTION_KEY`
-   - optionally `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET`
+   - required variable: `WEBHOOK_URL`
+   - required secrets: `WEBHOOK_SECRET`, `EMAIL_ENCRYPTION_KEY`
+   - optional variables: `WEBHOOK_TIMEOUT_MS`, `WEBHOOK_RETRY_DELAY_SECONDS`, `EMAIL_ENCRYPTION_KEY_ID`, `CF_ACCESS_CLIENT_ID`
+   - optional secret: `CF_ACCESS_CLIENT_SECRET`
 5. Deploy the Worker with Wrangler so the R2 binding, Queue producer binding, and queue consumer config are all applied from `wrangler.toml`.
+   - the repo no longer defines runtime `[vars]`; dashboard values are the source of truth
+   - `wrangler deploy` will validate the required secrets declared in [wrangler.toml](/Users/brian/code/CloudflareMail2Webhook/wrangler.toml)
 6. In each Cloudflare Email Routing zone, bind the inbound route to this Worker.
 7. In n8n:
    - keep the Webhook node on `POST`
