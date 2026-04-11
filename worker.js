@@ -1,9 +1,13 @@
 const DEFAULT_WEBHOOK_TIMEOUT_MS = 10000;
 const DEFAULT_RETRY_DELAY_SECONDS = 840;
-const MAX_R2_METADATA_VALUE_LENGTH = 1024;
-const ENCRYPTION_ALGORITHM = "AES-256-GCM";
-const ENCRYPTION_VERSION = 1;
+const ENCRYPTION_ALGORITHM = "AES-GCM";
+const ENCRYPTED_BLOB_MAGIC = new Uint8Array([67, 70, 69, 77]); // "CFEM"
+const ENCRYPTED_BLOB_VERSION = 1;
+const ENCRYPTED_PAYLOAD_VERSION = 1;
 const GCM_IV_LENGTH = 12;
+const ENCRYPTED_BLOB_HEADER_FIXED_LENGTH = 7;
+const textEncoder = new TextEncoder();
+
 let cachedEncryptionKeySecret = null;
 let cachedEncryptionKeyPromise = null;
 
@@ -33,12 +37,6 @@ function setOptionalHeader(headers, name, value) {
   }
 }
 
-function setOptionalMetadata(metadata, name, value) {
-  if (value !== null && value !== undefined && value !== "") {
-    metadata[name] = String(value).slice(0, MAX_R2_METADATA_VALUE_LENGTH);
-  }
-}
-
 function describeError(error) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -47,12 +45,21 @@ function base64ToBytes(base64) {
   return Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
 }
 
-function bytesToBase64(bytes) {
-  return btoa(String.fromCharCode(...bytes));
+function concatByteArrays(parts) {
+  const totalLength = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+
+  for (const part of parts) {
+    result.set(part, offset);
+    offset += part.byteLength;
+  }
+
+  return result;
 }
 
 async function sha256Hex(value) {
-  const data = new TextEncoder().encode(value);
+  const data = textEncoder.encode(value);
   const digest = await crypto.subtle.digest("SHA-256", data);
 
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -64,10 +71,8 @@ async function buildStorageKey(metadata) {
       `${metadata.messageId}\n${metadata.from}\n${metadata.to}` :
       metadata.eventId;
   const fingerprint = await sha256Hex(stableKeySource);
-  const datePath = metadata.timestamp.slice(0, 10).replace(/-/g, "/");
-  const recipientDomain = metadata.recipientDomain || "unknown-domain";
 
-  return `incoming/${datePath}/${recipientDomain}/${fingerprint}.eml`;
+  return `incoming/${fingerprint}.cfem`;
 }
 
 function ensureBindings(env) {
@@ -89,64 +94,80 @@ function ensureBindings(env) {
 }
 
 function buildEnvelopeMetadata(message, eventId, timestamp) {
-  const recipientDomain = getAddressDomain(message.to);
-  const recipientLocalPart = getAddressLocalPart(message.to);
-
   return {
     source: "cloudflare-worker",
     eventId,
     timestamp,
     from: message.from,
     to: message.to,
-    recipientDomain,
-    recipientLocalPart,
+    recipientDomain: getAddressDomain(message.to),
+    recipientLocalPart: getAddressLocalPart(message.to),
     messageId: message.headers.get("message-id"),
-    subject: message.headers.get("subject"),
     rawSize: message.rawSize,
   };
-}
-
-function buildR2CustomMetadata(metadata) {
-  const customMetadata = {};
-
-  setOptionalMetadata(customMetadata, "eventId", metadata.eventId);
-  setOptionalMetadata(customMetadata, "source", metadata.source);
-  setOptionalMetadata(customMetadata, "from", metadata.from);
-  setOptionalMetadata(customMetadata, "to", metadata.to);
-  setOptionalMetadata(customMetadata, "recipientDomain", metadata.recipientDomain);
-  setOptionalMetadata(customMetadata, "recipientLocalPart", metadata.recipientLocalPart);
-  setOptionalMetadata(customMetadata, "messageId", metadata.messageId);
-  setOptionalMetadata(customMetadata, "timestamp", metadata.timestamp);
-  setOptionalMetadata(customMetadata, "contentMode", metadata.contentMode);
-  setOptionalMetadata(customMetadata, "encryptionAlgorithm", metadata.encryption?.algorithm);
-  setOptionalMetadata(customMetadata, "encryptionKeyId", metadata.encryption?.keyId);
-
-  return customMetadata;
 }
 
 function getEncryptionKeyId(env) {
   return env.EMAIL_ENCRYPTION_KEY_ID || "v1";
 }
 
-function buildEncryptionAADPayload(metadata) {
+function buildEncryptedPayloadMetadata(metadata) {
   return {
-    version: ENCRYPTION_VERSION,
+    version: ENCRYPTED_PAYLOAD_VERSION,
     source: metadata.source,
     eventId: metadata.eventId,
     timestamp: metadata.timestamp,
-    from: metadata.from,
-    to: metadata.to,
-    recipientDomain: metadata.recipientDomain,
-    recipientLocalPart: metadata.recipientLocalPart,
-    messageId: metadata.messageId || "",
-    rawSize: metadata.rawSize,
-    keyId: metadata.encryption?.keyId || "",
-    algorithm: metadata.encryption?.algorithm || ENCRYPTION_ALGORITHM,
+    envelope: {
+      from: metadata.from,
+      to: metadata.to,
+    },
+    routing: {
+      recipientDomain: metadata.recipientDomain,
+      recipientLocalPart: metadata.recipientLocalPart,
+    },
+    headers: {
+      messageId: metadata.messageId || null,
+    },
+    rawSize: metadata.rawSize ?? null,
   };
 }
 
-function buildEncryptionAAD(metadata) {
-  return new TextEncoder().encode(JSON.stringify(buildEncryptionAADPayload(metadata)));
+function buildEncryptedBlobPrelude(keyId, iv) {
+  const keyIdBytes = textEncoder.encode(keyId);
+
+  if (keyIdBytes.byteLength > 255) {
+    throw new Error("EMAIL_ENCRYPTION_KEY_ID must be 255 bytes or fewer");
+  }
+
+  if (iv.byteLength > 255) {
+    throw new Error("Encryption IV must be 255 bytes or fewer");
+  }
+
+  const prelude = new Uint8Array(
+    ENCRYPTED_BLOB_HEADER_FIXED_LENGTH + keyIdBytes.byteLength + iv.byteLength
+  );
+
+  prelude.set(ENCRYPTED_BLOB_MAGIC, 0);
+  prelude[4] = ENCRYPTED_BLOB_VERSION;
+  prelude[5] = keyIdBytes.byteLength;
+  prelude[6] = iv.byteLength;
+  prelude.set(keyIdBytes, ENCRYPTED_BLOB_HEADER_FIXED_LENGTH);
+  prelude.set(iv, ENCRYPTED_BLOB_HEADER_FIXED_LENGTH + keyIdBytes.byteLength);
+
+  return prelude;
+}
+
+function buildEncryptedPayloadPlaintext(metadata, mimeBuffer) {
+  const metadataBytes = textEncoder.encode(JSON.stringify(buildEncryptedPayloadMetadata(metadata)));
+  const mimeBytes = mimeBuffer instanceof Uint8Array ? mimeBuffer : new Uint8Array(mimeBuffer);
+  const plaintext = new Uint8Array(4 + metadataBytes.byteLength + mimeBytes.byteLength);
+  const view = new DataView(plaintext.buffer);
+
+  view.setUint32(0, metadataBytes.byteLength);
+  plaintext.set(metadataBytes, 4);
+  plaintext.set(mimeBytes, 4 + metadataBytes.byteLength);
+
+  return plaintext;
 }
 
 async function importEncryptionKey(env) {
@@ -162,7 +183,7 @@ async function importEncryptionKey(env) {
       return crypto.subtle.importKey(
         "raw",
         keyBytes,
-        { name: "AES-GCM" },
+        { name: ENCRYPTION_ALGORITHM },
         false,
         ["encrypt"]
       );
@@ -173,69 +194,69 @@ async function importEncryptionKey(env) {
 }
 
 async function encryptMessageBody(env, metadata, plaintextBuffer) {
-  metadata.contentMode = "encrypted";
-  metadata.encryption = {
-    version: ENCRYPTION_VERSION,
-    algorithm: ENCRYPTION_ALGORITHM,
-    keyId: getEncryptionKeyId(env),
-  };
-
+  const keyId = getEncryptionKeyId(env);
   const iv = crypto.getRandomValues(new Uint8Array(GCM_IV_LENGTH));
+  const prelude = buildEncryptedBlobPrelude(keyId, iv);
   const key = await importEncryptionKey(env);
-  const ciphertext = await crypto.subtle.encrypt(
-    {
-      name: "AES-GCM",
-      iv,
-      additionalData: buildEncryptionAAD(metadata),
-      tagLength: 128,
-    },
-    key,
-    plaintextBuffer
+  const payloadPlaintext = buildEncryptedPayloadPlaintext(metadata, plaintextBuffer);
+  const ciphertext = new Uint8Array(
+    await crypto.subtle.encrypt(
+      {
+        name: ENCRYPTION_ALGORITHM,
+        iv,
+        additionalData: prelude,
+        tagLength: 128,
+      },
+      key,
+      payloadPlaintext
+    )
   );
 
-  metadata.encryption.iv = bytesToBase64(iv);
-
-  return ciphertext;
+  return concatByteArrays([prelude, ciphertext]);
 }
 
-function buildWebhookHeaders(env, metadata, deliveryMode, queueAttempt = null) {
+function buildLegacyWebhookHeaders(headers, legacyMetadata) {
+  setOptionalHeader(headers, "X-Email-Source", legacyMetadata.source);
+  setOptionalHeader(headers, "X-Email-Event-Id", legacyMetadata.eventId);
+  setOptionalHeader(headers, "X-Email-Timestamp", legacyMetadata.timestamp);
+  setOptionalHeader(headers, "X-Envelope-From", legacyMetadata.from);
+  setOptionalHeader(headers, "X-Envelope-To", legacyMetadata.to);
+  setOptionalHeader(headers, "X-Recipient-Domain", legacyMetadata.recipientDomain);
+  setOptionalHeader(headers, "X-Recipient-Local-Part", legacyMetadata.recipientLocalPart);
+  setOptionalHeader(headers, "X-Email-Message-Id", legacyMetadata.messageId);
+  setOptionalHeader(headers, "X-Email-Raw-Size", legacyMetadata.rawSize);
+  setOptionalHeader(headers, "X-Email-Content-Mode", legacyMetadata.contentMode || "encrypted");
+  setOptionalHeader(headers, "X-Email-Encryption-Version", legacyMetadata.encryption?.version);
+  setOptionalHeader(headers, "X-Email-Encryption-Algorithm", legacyMetadata.encryption?.algorithm);
+  setOptionalHeader(headers, "X-Email-Encryption-IV", legacyMetadata.encryption?.iv);
+  setOptionalHeader(headers, "X-Email-Encryption-Key-Id", legacyMetadata.encryption?.keyId);
+}
+
+function buildWebhookHeaders(env, legacyMetadata = null) {
   const headers = new Headers({
-    "Content-Type": metadata.contentMode === "encrypted" ? "application/octet-stream" : "message/rfc822",
+    "Content-Type": "application/octet-stream",
     "User-Agent": "Cloudflare-Email-Relay",
     "X-Webhook-Secret": env.WEBHOOK_SECRET,
-    "X-Email-Source": metadata.source,
-    "X-Email-Event-Id": metadata.eventId,
-    "X-Email-Timestamp": metadata.timestamp,
-    "X-Envelope-From": metadata.from,
-    "X-Envelope-To": metadata.to,
-    "X-Recipient-Domain": metadata.recipientDomain,
-    "X-Recipient-Local-Part": metadata.recipientLocalPart,
-    "X-Email-Raw-Size": String(metadata.rawSize),
-    "X-Delivery-Mode": deliveryMode,
-    "X-Email-Content-Mode": metadata.contentMode || "plain",
   });
 
-  setOptionalHeader(headers, "X-Email-Message-Id", metadata.messageId);
-  setOptionalHeader(headers, "X-Email-Storage-Key", metadata.storageKey);
-  setOptionalHeader(headers, "X-Queue-Attempt", queueAttempt);
-  setOptionalHeader(headers, "X-Email-Encryption-Version", metadata.encryption?.version);
-  setOptionalHeader(headers, "X-Email-Encryption-Algorithm", metadata.encryption?.algorithm);
-  setOptionalHeader(headers, "X-Email-Encryption-IV", metadata.encryption?.iv);
-  setOptionalHeader(headers, "X-Email-Encryption-Key-Id", metadata.encryption?.keyId);
+  if (legacyMetadata) {
+    buildLegacyWebhookHeaders(headers, legacyMetadata);
+  }
+
   setOptionalHeader(headers, "CF-Access-Client-Id", env.CF_ACCESS_CLIENT_ID);
   setOptionalHeader(headers, "CF-Access-Client-Secret", env.CF_ACCESS_CLIENT_SECRET);
 
   return headers;
 }
 
-async function deliverToWebhook(env, metadata, body, deliveryMode, queueAttempt = null) {
+async function deliverToWebhook(env, body, legacyMetadata = null) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort("Webhook timeout"), getWebhookTimeoutMs(env));
 
   try {
     const response = await fetch(env.WEBHOOK_URL, {
       method: "POST",
-      headers: buildWebhookHeaders(env, metadata, deliveryMode, queueAttempt),
+      headers: buildWebhookHeaders(env, legacyMetadata),
       body,
       signal: controller.signal,
       redirect: "manual",
@@ -247,8 +268,7 @@ async function deliverToWebhook(env, metadata, body, deliveryMode, queueAttempt 
     }
 
     if (!response.ok) {
-      const upstreamBody = (await response.text()).slice(0, 500);
-      throw new Error(`Upstream returned ${response.status}: ${upstreamBody}`);
+      throw new Error(`Upstream returned ${response.status}`);
     }
 
     return response;
@@ -257,17 +277,17 @@ async function deliverToWebhook(env, metadata, body, deliveryMode, queueAttempt 
   }
 }
 
-async function getStoredMessageBody(env, metadata) {
-  const storedMessage = await env.MAIL_R2.get(metadata.storageKey);
+async function getStoredMessageBody(env, storageKey) {
+  const storedMessage = await env.MAIL_R2.get(storageKey);
 
   if (!storedMessage) {
-    throw new Error(`Stored message not found for ${metadata.storageKey}`);
+    throw new Error(`Stored message not found for ${storageKey}`);
   }
 
   const body = await storedMessage.arrayBuffer();
 
   if (!body.byteLength) {
-    throw new Error(`Stored message body is empty for ${metadata.storageKey}`);
+    throw new Error(`Stored message body is empty for ${storageKey}`);
   }
 
   return body;
@@ -283,23 +303,9 @@ async function readIncomingMessageBody(message) {
   return body;
 }
 
-async function enqueueRetry(env, metadata, delaySeconds) {
+async function enqueueRetry(env, storageKey, delaySeconds) {
   await env.MAIL_RETRY_QUEUE.send(
-    {
-      version: 1,
-      source: metadata.source,
-      eventId: metadata.eventId,
-      timestamp: metadata.timestamp,
-      from: metadata.from,
-      to: metadata.to,
-      recipientDomain: metadata.recipientDomain,
-      recipientLocalPart: metadata.recipientLocalPart,
-      messageId: metadata.messageId,
-      rawSize: metadata.rawSize,
-      storageKey: metadata.storageKey,
-      contentMode: metadata.contentMode || "plain",
-      encryption: metadata.encryption || null,
-    },
+    { storageKey },
     {
       contentType: "json",
       delaySeconds,
@@ -307,16 +313,39 @@ async function enqueueRetry(env, metadata, delaySeconds) {
   );
 }
 
-function scheduleDelete(ctx, env, metadata, reason) {
+function normalizeQueuePayload(body) {
+  if (typeof body === "string" && body.length > 0) {
+    return {
+      storageKey: body,
+      legacyMetadata: null,
+    };
+  }
+
+  if (body && typeof body === "object" && typeof body.storageKey === "string" && body.storageKey.length > 0) {
+    const hasLegacyMetadata =
+      Object.prototype.hasOwnProperty.call(body, "encryption") ||
+      Object.prototype.hasOwnProperty.call(body, "from") ||
+      Object.prototype.hasOwnProperty.call(body, "to") ||
+      Object.prototype.hasOwnProperty.call(body, "eventId");
+
+    return {
+      storageKey: body.storageKey,
+      legacyMetadata: hasLegacyMetadata ? body : null,
+    };
+  }
+
+  throw new Error("Invalid queue payload");
+}
+
+function scheduleDelete(ctx, env, storageKey, reason) {
   ctx.waitUntil(
-    env.MAIL_R2.delete(metadata.storageKey).catch((error) => {
+    env.MAIL_R2.delete(storageKey).catch((error) => {
       console.error(
         JSON.stringify({
           level: "error",
           event: "mail_r2_delete_failed",
           reason,
-          eventId: metadata.eventId,
-          storageKey: metadata.storageKey,
+          storageKey,
           error: describeError(error),
         })
       );
@@ -349,11 +378,6 @@ export default {
 
       logInfo("mail_received", {
         eventId,
-        from: metadata.from,
-        to: metadata.to,
-        recipientDomain: metadata.recipientDomain,
-        rawSize: metadata.rawSize,
-        messageId: metadata.messageId,
         storageKey: metadata.storageKey,
       });
 
@@ -364,26 +388,22 @@ export default {
         httpMetadata: {
           contentType: "application/octet-stream",
         },
-        customMetadata: buildR2CustomMetadata(metadata),
       });
 
       logInfo("mail_stored", {
         eventId,
         storageKey: metadata.storageKey,
-        recipientDomain: metadata.recipientDomain,
       });
 
       try {
-        const response = await deliverToWebhook(env, metadata, encryptedBody, "direct");
+        const response = await deliverToWebhook(env, encryptedBody);
 
-        scheduleDelete(ctx, env, metadata, "direct_delivery");
+        scheduleDelete(ctx, env, metadata.storageKey, "direct_delivery");
 
         logInfo("mail_relay_success", {
           deliveryMode: "direct",
           eventId,
-          to: metadata.to,
-          recipientDomain: metadata.recipientDomain,
-          responseUrl: response.url,
+          storageKey: metadata.storageKey,
           status: response.status,
         });
 
@@ -394,19 +414,17 @@ export default {
         logWarn("mail_relay_deferred", {
           deliveryMode: "direct",
           eventId,
-          to: metadata.to,
-          recipientDomain: metadata.recipientDomain,
+          storageKey: metadata.storageKey,
           retryDelaySeconds,
           error: describeError(directError),
         });
 
         try {
-          await enqueueRetry(env, metadata, retryDelaySeconds);
+          await enqueueRetry(env, metadata.storageKey, retryDelaySeconds);
 
           logInfo("mail_retry_enqueued", {
             eventId,
             storageKey: metadata.storageKey,
-            recipientDomain: metadata.recipientDomain,
             retryDelaySeconds,
           });
 
@@ -420,12 +438,6 @@ export default {
     } catch (error) {
       logError("mail_relay_failure", {
         eventId,
-        from: metadata.from,
-        to: metadata.to,
-        recipientDomain: metadata.recipientDomain,
-        rawSize: metadata.rawSize,
-        messageId: metadata.messageId,
-        subject: metadata.subject,
         storageKey: metadata.storageKey || null,
         error: describeError(error),
       });
@@ -438,36 +450,28 @@ export default {
     ensureBindings(env);
 
     for (const message of batch.messages) {
-      const metadata = message.body;
+      let storageKey = null;
 
       try {
-        const queuedBody = await getStoredMessageBody(env, metadata);
-        const response = await deliverToWebhook(
-          env,
-          metadata,
-          queuedBody,
-          "queue",
-          message.attempts
-        );
+        const normalized = normalizeQueuePayload(message.body);
 
-        scheduleDelete(ctx, env, metadata, "queue_delivery");
+        storageKey = normalized.storageKey;
+
+        const queuedBody = await getStoredMessageBody(env, storageKey);
+        const response = await deliverToWebhook(env, queuedBody, normalized.legacyMetadata);
+
+        scheduleDelete(ctx, env, storageKey, "queue_delivery");
         message.ack();
 
         logInfo("mail_relay_success", {
           deliveryMode: "queue",
-          eventId: metadata.eventId || message.id,
-          to: metadata.to,
-          recipientDomain: metadata.recipientDomain,
+          storageKey,
           queueAttempt: message.attempts,
-          responseUrl: response.url,
           status: response.status,
         });
       } catch (error) {
         logError("queue_delivery_failed", {
-          eventId: metadata.eventId || message.id,
-          to: metadata.to,
-          recipientDomain: metadata.recipientDomain,
-          storageKey: metadata.storageKey,
+          storageKey,
           queueAttempt: message.attempts,
           retryDelaySeconds: getRetryDelaySeconds(env),
           error: describeError(error),

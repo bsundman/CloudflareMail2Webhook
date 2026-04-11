@@ -15,50 +15,59 @@ function getRequiredHeader(name) {
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
-const receivedSecret = getRequiredHeader('x-webhook-secret');
-
-const isValid = receivedSecret === MY_SECRET;
-
-if (isValid) {
-  const from = getRequiredHeader('x-envelope-from');
-  const to = getRequiredHeader('x-envelope-to');
+function buildLegacyPayload(binaryProperty) {
   const contentMode = getHeader('x-email-content-mode') ?? 'plain';
   const encryptionVersionHeader = getHeader('x-email-encryption-version');
   const encryptionVersion = Number.parseInt(encryptionVersionHeader ?? '', 10);
 
-  const encryption =
-    contentMode === 'encrypted' ?
-      {
-        version: Number.isFinite(encryptionVersion) ? encryptionVersion : null,
-        algorithm: getHeader('x-email-encryption-algorithm') ?? null,
-        iv: getHeader('x-email-encryption-iv') ?? null,
-        keyId: getHeader('x-email-encryption-key-id') ?? null,
-      } :
-      null;
-
   return {
-    json: {
-      authenticated: true,
-      details: 'Access Granted',
-      source: getHeader('x-email-source') ?? 'cloudflare-worker',
-      eventId: getHeader('x-email-event-id') ?? null,
-      timestamp: getHeader('x-email-timestamp') ?? null,
-      envelope: {
-        from,
-        to,
-      },
-      routing: {
-        recipientDomain: getHeader('x-recipient-domain') ?? null,
-        recipientLocalPart: getHeader('x-recipient-local-part') ?? null,
-      },
-      headers: {
-        messageId: getHeader('x-email-message-id') ?? null,
-      },
-      rawSize: Number.parseInt(getHeader('x-email-raw-size') ?? '', 10) || null,
-      contentMode,
-      encryption,
-      binaryProperty: binaryPropertyName,
+    authenticated: true,
+    details: 'Access Granted',
+    source: getHeader('x-email-source') ?? 'cloudflare-worker',
+    eventId: getHeader('x-email-event-id') ?? null,
+    timestamp: getHeader('x-email-timestamp') ?? null,
+    envelope: {
+      from: getHeader('x-envelope-from') ?? null,
+      to: getHeader('x-envelope-to') ?? null,
     },
+    routing: {
+      recipientDomain: getHeader('x-recipient-domain') ?? null,
+      recipientLocalPart: getHeader('x-recipient-local-part') ?? null,
+    },
+    headers: {
+      messageId: getHeader('x-email-message-id') ?? null,
+    },
+    rawSize: Number.parseInt(getHeader('x-email-raw-size') ?? '', 10) || null,
+    contentMode,
+    encryption:
+      contentMode === 'encrypted' ?
+        {
+          version: Number.isFinite(encryptionVersion) ? encryptionVersion : null,
+          algorithm: getHeader('x-email-encryption-algorithm') ?? null,
+          iv: getHeader('x-email-encryption-iv') ?? null,
+          keyId: getHeader('x-email-encryption-key-id') ?? null,
+        } :
+        null,
+    binaryProperty,
+  };
+}
+
+const receivedSecret = getRequiredHeader('x-webhook-secret');
+const isValid = receivedSecret === MY_SECRET;
+const hasLegacyEnvelopeHeaders =
+  !!getHeader('x-envelope-from') ||
+  !!getHeader('x-envelope-to') ||
+  !!getHeader('x-email-encryption-iv');
+
+if (isValid) {
+  return {
+    json: hasLegacyEnvelopeHeaders ?
+      buildLegacyPayload(binaryPropertyName) :
+      {
+        authenticated: true,
+        details: 'Access Granted',
+        binaryProperty: binaryPropertyName,
+      },
     binary: item.binary,
   };
 }
@@ -72,7 +81,6 @@ return {
       has_headers: Object.keys(headers).length > 0,
       has_binary: !!binaryPropertyName,
       binary_property: binaryPropertyName,
-      content_mode: getHeader('x-email-content-mode') ?? null,
     },
   },
 };
