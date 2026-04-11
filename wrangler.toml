@@ -4,17 +4,17 @@ compatibility_date = "2026-04-04"
 keep_vars = true
 
 [observability]
-enabled = true
-head_sampling_rate = 1
+enabled = false
+head_sampling_rate = 0
 
 [observability.logs]
-enabled = true
-head_sampling_rate = 1
-invocation_logs = true
+enabled = false
+head_sampling_rate = 0
+invocation_logs = false
 
 [observability.traces]
 enabled = false
-head_sampling_rate = 1
+head_sampling_rate = 0
 
 # Runtime configuration is intentionally managed in the Cloudflare dashboard.
 # `keep_vars = true` preserves existing dashboard vars/secrets on deploy.
