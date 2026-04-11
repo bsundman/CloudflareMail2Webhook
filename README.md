@@ -16,39 +16,34 @@ Script for Cloudflare worker to process and send email to external webhook url
 - If you keep the webhook behind Cloudflare Access, add `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` as Worker secrets.
 
 # Deploy
-- Create one R2 bucket for stored `.eml` payloads and bind it in the Cloudflare dashboard as `MAIL_R2`.
-- Create one retry queue and one dead-letter queue, then attach the retry queue to the Worker in the Cloudflare dashboard as `MAIL_RETRY_QUEUE`.
+- Create one R2 bucket for stored `.eml` payloads.
+- Create one retry queue and one dead-letter queue.
+- Keep the real resource names in `wrangler.toml` so deploys are reproducible.
 - Keep `max_batch_size = 1` unless you want a failed delivery to retry a whole batch together.
 - On Cloudflare Free, queue messages are limited to `128 KB`, which is why only the pointer/metadata is stored in the queue and the full email lives in R2.
 
 # Cloudflare Setup
 1. Create an R2 bucket dedicated to inbound email spool files.
 2. Create a Queue for retry pointers and a second Queue for dead-letter messages.
-3. In the Worker dashboard, add bindings:
-   - R2 bucket binding named `MAIL_R2`
-   - Queue producer binding named `MAIL_RETRY_QUEUE`
-4. Configure the queue consumer attachment for this Worker:
-   - attach this Worker as the consumer for your retry queue
-   - set `max_batch_size = 1`
-   - set `max_batch_timeout = 1`
-   - set `max_retries = 100`
-   - set `retry_delay = 840`
-   - set the dead-letter queue to your retry DLQ
-   - if you prefer config as code for the consumer, uncomment the template in `wrangler.toml` and set the real queue names there
-5. Add Worker secrets/vars:
+3. Keep the resource bindings in `wrangler.toml`:
+   - `MAIL_R2` -> R2 bucket `email`
+   - `MAIL_RETRY_QUEUE` -> Queue `email`
+   - queue consumer -> Queue `email`
+   - dead-letter queue -> `dlq`
+4. Add Worker secrets/vars in the dashboard:
    - `WEBHOOK_URL`
    - `WEBHOOK_SECRET`
    - `WEBHOOK_TIMEOUT_MS`
    - `WEBHOOK_RETRY_DELAY_SECONDS`
    - optionally `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET`
-6. Deploy the Worker with the R2 and Queue bindings present.
-7. In each Cloudflare Email Routing zone, bind the inbound route to this Worker.
-8. In n8n:
+5. Deploy the Worker with Wrangler so the R2 binding, Queue producer binding, and queue consumer config are all applied from `wrangler.toml`.
+6. In each Cloudflare Email Routing zone, bind the inbound route to this Worker.
+7. In n8n:
    - keep the Webhook node on `POST`
    - keep `Respond` set to `Using "Respond to Webhook" Node`
    - keep `Raw Body` enabled
    - update the Code nodes from `relay/verifyWebhookSecret.js` and `relay/injectSMTP.js`
-9. If `relay.sundman.ca` or another webhook hostname is protected by Cloudflare Access, either:
+8. If `relay.sundman.ca` or another webhook hostname is protected by Cloudflare Access, either:
    - add a bypass for the machine webhook path, or
    - configure Worker service-token secrets so the request is allowed through Access.
 

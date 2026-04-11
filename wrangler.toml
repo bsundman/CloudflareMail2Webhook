@@ -9,12 +9,10 @@ head_sampling_rate = 1
 [observability.logs]
 enabled = true
 head_sampling_rate = 1
-persist = true
 invocation_logs = true
 
 [observability.traces]
 enabled = false
-persist = true
 head_sampling_rate = 1
 
 [vars]
@@ -27,17 +25,19 @@ WEBHOOK_RETRY_DELAY_SECONDS = "840"
 # Optional secrets for a webhook protected by Cloudflare Access:
 # CF_ACCESS_CLIENT_ID
 # CF_ACCESS_CLIENT_SECRET
-# Bind the following in the Cloudflare dashboard:
-# - R2 bucket binding named MAIL_R2
-# - Queue producer binding named MAIL_RETRY_QUEUE
-#
-# Queue consumer settings are still best managed via Wrangler/CLI/API because
-# Cloudflare documents consumer worker configuration there:
-#
-# [[queues.consumers]]
-# queue = "YOUR_RETRY_QUEUE_NAME"
-# max_batch_size = 1
-# max_batch_timeout = 1
-# max_retries = 100
-# dead_letter_queue = "YOUR_RETRY_DLQ_NAME"
-# retry_delay = 840
+
+[[r2_buckets]]
+binding = "MAIL_R2"
+bucket_name = "email"
+
+[[queues.producers]]
+binding = "MAIL_RETRY_QUEUE"
+queue = "email"
+
+[[queues.consumers]]
+queue = "email"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 100
+dead_letter_queue = "dlq"
+retry_delay = 840
