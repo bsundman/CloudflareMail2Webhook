@@ -159,6 +159,22 @@ async function deliverToWebhook(env, metadata, body, deliveryMode, queueAttempt 
   }
 }
 
+async function getStoredMessageBody(env, metadata) {
+  const storedMessage = await env.MAIL_R2.get(metadata.storageKey);
+
+  if (!storedMessage) {
+    throw new Error(`Stored message not found for ${metadata.storageKey}`);
+  }
+
+  const body = await storedMessage.arrayBuffer();
+
+  if (!body.byteLength) {
+    throw new Error(`Stored message body is empty for ${metadata.storageKey}`);
+  }
+
+  return body;
+}
+
 async function enqueueRetry(env, metadata, delaySeconds) {
   await env.MAIL_RETRY_QUEUE.send(
     {
@@ -231,9 +247,7 @@ export default {
         storageKey: metadata.storageKey,
       });
 
-      const [storageStream, directStream] = message.raw.tee();
-
-      await env.MAIL_R2.put(metadata.storageKey, storageStream, {
+      await env.MAIL_R2.put(metadata.storageKey, message.raw, {
         httpMetadata: {
           contentType: "message/rfc822",
         },
@@ -247,7 +261,8 @@ export default {
       });
 
       try {
-        const response = await deliverToWebhook(env, metadata, directStream, "direct");
+        const directBody = await getStoredMessageBody(env, metadata);
+        const response = await deliverToWebhook(env, metadata, directBody, "direct");
 
         scheduleDelete(ctx, env, metadata, "direct_delivery");
 
@@ -314,22 +329,11 @@ export default {
       const metadata = message.body;
 
       try {
-        const storedMessage = await env.MAIL_R2.get(metadata.storageKey);
-
-        if (!storedMessage?.body) {
-          logWarn("queue_message_missing_r2_object", {
-            eventId: metadata.eventId || message.id,
-            storageKey: metadata.storageKey,
-            queueAttempt: message.attempts,
-          });
-          message.ack();
-          continue;
-        }
-
+        const queuedBody = await getStoredMessageBody(env, metadata);
         const response = await deliverToWebhook(
           env,
           metadata,
-          storedMessage.body,
+          queuedBody,
           "queue",
           message.attempts
         );
