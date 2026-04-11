@@ -20,11 +20,14 @@ WEBHOOK_URL = "REPLACE_IN_DASHBOARD"
 WEBHOOK_SECRET = "REPLACE_IN_DASHBOARD"
 WEBHOOK_TIMEOUT_MS = "10000"
 WEBHOOK_RETRY_DELAY_SECONDS = "840"
+EMAIL_ENCRYPTION_KEY_ID = "v1"
 # You can put non-sensitive vars here, 
 # but keep secrets in the Cloudflare Dashboard!
 # Optional secrets for a webhook protected by Cloudflare Access:
 # CF_ACCESS_CLIENT_ID
 # CF_ACCESS_CLIENT_SECRET
+# Required secret for payload encryption:
+# EMAIL_ENCRYPTION_KEY
 
 [[r2_buckets]]
 binding = "MAIL_R2"

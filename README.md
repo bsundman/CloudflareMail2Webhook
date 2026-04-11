@@ -4,8 +4,11 @@ Script for Cloudflare worker to process and send email to external webhook url
 # Notes
 - Files under `relay/` are intended to be pasted into n8n Code nodes, not run as standalone Node.js scripts.
 - The current flow is hybrid and store-first: Cloudflare Email Worker -> R2 spool -> direct webhook attempt -> Queue retry worker -> n8n -> SMTP injection.
-- The worker now posts the raw MIME message as `message/rfc822` and sends routing/auth metadata in HTTP headers.
+- The worker encrypts the entire raw MIME message with AES-256-GCM before storing it in R2 or sending it to n8n.
+- The worker sends ciphertext as `application/octet-stream` and includes routing/auth/encryption metadata in HTTP headers.
 - In n8n, enable `Raw Body` on the Webhook node and set the binary property name to `data` if you want to use the sample Code nodes unchanged.
+- In n8n, use a separate Code node to decrypt the MIME payload after signature verification and before SMTP injection.
+- The n8n instance must allow the built-in `crypto` module in Code nodes, for example with `NODE_FUNCTION_ALLOW_BUILTIN=crypto`.
 - The message is written to R2 before any direct delivery attempt, so the fast path does not sacrifice durability.
 - Cloudflare documents `message.setReject()` as a permanent SMTP reject, so do not use it for "retry later" behavior.
 - In n8n, the SMTP Code node must throw on failure. Returning `{ success: false }` and then replying `200` will silently lose mail.
@@ -35,6 +38,8 @@ Script for Cloudflare worker to process and send email to external webhook url
    - `WEBHOOK_SECRET`
    - `WEBHOOK_TIMEOUT_MS`
    - `WEBHOOK_RETRY_DELAY_SECONDS`
+   - `EMAIL_ENCRYPTION_KEY_ID`
+   - secret: `EMAIL_ENCRYPTION_KEY`
    - optionally `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET`
 5. Deploy the Worker with Wrangler so the R2 binding, Queue producer binding, and queue consumer config are all applied from `wrangler.toml`.
 6. In each Cloudflare Email Routing zone, bind the inbound route to this Worker.
@@ -42,17 +47,20 @@ Script for Cloudflare worker to process and send email to external webhook url
    - keep the Webhook node on `POST`
    - keep `Respond` set to `Using "Respond to Webhook" Node`
    - keep `Raw Body` enabled
-   - update the Code nodes from `relay/verifyWebhookSecret.js` and `relay/injectSMTP.js`
+   - allow the built-in `crypto` module for Code nodes
+   - wire the workflow as `Webhook -> JS: Verify Signature -> JS: Decrypt MIME -> JS: Inject SMTP -> Respond to Webhook`
+   - set the `ENCRYPTION_KEYS` map in `relay/decryptMime.js` so the key ID from the Worker resolves to the same base64 32-byte key
+   - update the Code nodes from `relay/verifyWebhookSecret.js`, `relay/decryptMime.js`, and `relay/injectSMTP.js`
 8. If `relay.sundman.ca` or another webhook hostname is protected by Cloudflare Access, either:
    - add a bypass for the machine webhook path, or
    - configure Worker service-token secrets so the request is allowed through Access.
 
 # Data Lifecycle
-- On successful direct delivery, the Worker schedules the R2 object for deletion.
-- On successful queue delivery, the queue consumer schedules the R2 object for deletion.
-- If delivery keeps failing, the `.eml` file remains in R2 and the retry pointer remains in Queue until retries are exhausted or the message lands in the DLQ.
-- If R2 deletion fails after a successful delivery, the mail is already delivered and only the stored spool copy remains; the Worker logs that cleanup failure.
+- On successful direct delivery, the Worker schedules the encrypted R2 object for deletion.
+- On successful queue delivery, the queue consumer schedules the encrypted R2 object for deletion.
+- If delivery keeps failing, the encrypted object remains in R2 and the retry pointer remains in Queue until retries are exhausted or the message lands in the DLQ.
+- If R2 deletion fails after a successful delivery, the mail is already delivered and only the encrypted spool copy remains; the Worker logs that cleanup failure.
 
 # TODO
 - Test offline and error handling
-- Add email encryption option
+- Add a documented key-rotation playbook

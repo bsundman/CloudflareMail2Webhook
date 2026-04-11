@@ -1,6 +1,11 @@
 const DEFAULT_WEBHOOK_TIMEOUT_MS = 10000;
 const DEFAULT_RETRY_DELAY_SECONDS = 840;
 const MAX_R2_METADATA_VALUE_LENGTH = 1024;
+const ENCRYPTION_ALGORITHM = "AES-256-GCM";
+const ENCRYPTION_VERSION = 1;
+const GCM_IV_LENGTH = 12;
+let cachedEncryptionKeySecret = null;
+let cachedEncryptionKeyPromise = null;
 
 function getAddressDomain(address) {
   const atIndex = address.lastIndexOf("@");
@@ -24,7 +29,7 @@ function getRetryDelaySeconds(env) {
 
 function setOptionalHeader(headers, name, value) {
   if (value !== null && value !== undefined && value !== "") {
-    headers.set(name, value);
+    headers.set(name, String(value));
   }
 }
 
@@ -36,6 +41,14 @@ function setOptionalMetadata(metadata, name, value) {
 
 function describeError(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function base64ToBytes(base64) {
+  return Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+}
+
+function bytesToBase64(bytes) {
+  return btoa(String.fromCharCode(...bytes));
 }
 
 async function sha256Hex(value) {
@@ -70,6 +83,9 @@ function ensureBindings(env) {
   if (!env.MAIL_RETRY_QUEUE || typeof env.MAIL_RETRY_QUEUE.send !== "function") {
     throw new Error("Missing MAIL_RETRY_QUEUE queue binding");
   }
+  if (!env.EMAIL_ENCRYPTION_KEY) {
+    throw new Error("Missing EMAIL_ENCRYPTION_KEY secret");
+  }
 }
 
 function buildEnvelopeMetadata(message, eventId, timestamp) {
@@ -101,13 +117,90 @@ function buildR2CustomMetadata(metadata) {
   setOptionalMetadata(customMetadata, "recipientLocalPart", metadata.recipientLocalPart);
   setOptionalMetadata(customMetadata, "messageId", metadata.messageId);
   setOptionalMetadata(customMetadata, "timestamp", metadata.timestamp);
+  setOptionalMetadata(customMetadata, "contentMode", metadata.contentMode);
+  setOptionalMetadata(customMetadata, "encryptionAlgorithm", metadata.encryption?.algorithm);
+  setOptionalMetadata(customMetadata, "encryptionKeyId", metadata.encryption?.keyId);
 
   return customMetadata;
 }
 
+function getEncryptionKeyId(env) {
+  return env.EMAIL_ENCRYPTION_KEY_ID || "v1";
+}
+
+function buildEncryptionAADPayload(metadata) {
+  return {
+    version: ENCRYPTION_VERSION,
+    source: metadata.source,
+    eventId: metadata.eventId,
+    timestamp: metadata.timestamp,
+    from: metadata.from,
+    to: metadata.to,
+    recipientDomain: metadata.recipientDomain,
+    recipientLocalPart: metadata.recipientLocalPart,
+    messageId: metadata.messageId || "",
+    rawSize: metadata.rawSize,
+    keyId: metadata.encryption?.keyId || "",
+    algorithm: metadata.encryption?.algorithm || ENCRYPTION_ALGORITHM,
+  };
+}
+
+function buildEncryptionAAD(metadata) {
+  return new TextEncoder().encode(JSON.stringify(buildEncryptionAADPayload(metadata)));
+}
+
+async function importEncryptionKey(env) {
+  if (cachedEncryptionKeySecret !== env.EMAIL_ENCRYPTION_KEY || !cachedEncryptionKeyPromise) {
+    cachedEncryptionKeySecret = env.EMAIL_ENCRYPTION_KEY;
+    cachedEncryptionKeyPromise = (async () => {
+      const keyBytes = base64ToBytes(env.EMAIL_ENCRYPTION_KEY);
+
+      if (keyBytes.byteLength !== 32) {
+        throw new Error("EMAIL_ENCRYPTION_KEY must be a base64-encoded 32-byte key");
+      }
+
+      return crypto.subtle.importKey(
+        "raw",
+        keyBytes,
+        { name: "AES-GCM" },
+        false,
+        ["encrypt"]
+      );
+    })();
+  }
+
+  return cachedEncryptionKeyPromise;
+}
+
+async function encryptMessageBody(env, metadata, plaintextBuffer) {
+  metadata.contentMode = "encrypted";
+  metadata.encryption = {
+    version: ENCRYPTION_VERSION,
+    algorithm: ENCRYPTION_ALGORITHM,
+    keyId: getEncryptionKeyId(env),
+  };
+
+  const iv = crypto.getRandomValues(new Uint8Array(GCM_IV_LENGTH));
+  const key = await importEncryptionKey(env);
+  const ciphertext = await crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv,
+      additionalData: buildEncryptionAAD(metadata),
+      tagLength: 128,
+    },
+    key,
+    plaintextBuffer
+  );
+
+  metadata.encryption.iv = bytesToBase64(iv);
+
+  return ciphertext;
+}
+
 function buildWebhookHeaders(env, metadata, deliveryMode, queueAttempt = null) {
   const headers = new Headers({
-    "Content-Type": "message/rfc822",
+    "Content-Type": metadata.contentMode === "encrypted" ? "application/octet-stream" : "message/rfc822",
     "User-Agent": "Cloudflare-Email-Relay",
     "X-Webhook-Secret": env.WEBHOOK_SECRET,
     "X-Email-Source": metadata.source,
@@ -119,11 +212,16 @@ function buildWebhookHeaders(env, metadata, deliveryMode, queueAttempt = null) {
     "X-Recipient-Local-Part": metadata.recipientLocalPart,
     "X-Email-Raw-Size": String(metadata.rawSize),
     "X-Delivery-Mode": deliveryMode,
+    "X-Email-Content-Mode": metadata.contentMode || "plain",
   });
 
   setOptionalHeader(headers, "X-Email-Message-Id", metadata.messageId);
   setOptionalHeader(headers, "X-Email-Storage-Key", metadata.storageKey);
   setOptionalHeader(headers, "X-Queue-Attempt", queueAttempt);
+  setOptionalHeader(headers, "X-Email-Encryption-Version", metadata.encryption?.version);
+  setOptionalHeader(headers, "X-Email-Encryption-Algorithm", metadata.encryption?.algorithm);
+  setOptionalHeader(headers, "X-Email-Encryption-IV", metadata.encryption?.iv);
+  setOptionalHeader(headers, "X-Email-Encryption-Key-Id", metadata.encryption?.keyId);
   setOptionalHeader(headers, "CF-Access-Client-Id", env.CF_ACCESS_CLIENT_ID);
   setOptionalHeader(headers, "CF-Access-Client-Secret", env.CF_ACCESS_CLIENT_SECRET);
 
@@ -199,6 +297,8 @@ async function enqueueRetry(env, metadata, delaySeconds) {
       messageId: metadata.messageId,
       rawSize: metadata.rawSize,
       storageKey: metadata.storageKey,
+      contentMode: metadata.contentMode || "plain",
+      encryption: metadata.encryption || null,
     },
     {
       contentType: "json",
@@ -258,10 +358,11 @@ export default {
       });
 
       const incomingBody = await readIncomingMessageBody(message);
+      const encryptedBody = await encryptMessageBody(env, metadata, incomingBody);
 
-      await env.MAIL_R2.put(metadata.storageKey, incomingBody, {
+      await env.MAIL_R2.put(metadata.storageKey, encryptedBody, {
         httpMetadata: {
-          contentType: "message/rfc822",
+          contentType: "application/octet-stream",
         },
         customMetadata: buildR2CustomMetadata(metadata),
       });
@@ -273,7 +374,7 @@ export default {
       });
 
       try {
-        const response = await deliverToWebhook(env, metadata, incomingBody, "direct");
+        const response = await deliverToWebhook(env, metadata, encryptedBody, "direct");
 
         scheduleDelete(ctx, env, metadata, "direct_delivery");
 

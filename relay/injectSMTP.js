@@ -56,6 +56,7 @@ for (let i = 0; i < items.length; i++) {
         payload.routing?.recipientDomain ||
         ((to || "").split('@')[1] || "").toLowerCase(),
       worker_event_id: payload.eventId || null,
+      content_mode: payload.contentMode || 'plain',
       raw_size: rawMimeBuffer.length,
       binary_property: binaryPropertyName,
     };
